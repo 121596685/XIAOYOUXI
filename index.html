@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+<title>弹幕躲避 · 硬核版</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; overflow: hidden; font-family: 'Courier New', monospace; touch-action: none; }
+canvas { display: block; }
+
+#ui {
+  position: fixed; top: 0; left: 0; right: 0;
+  padding: 12px 16px;
+  display: flex; justify-content: space-between; align-items: center;
+  color: #0ff; font-size: 14px; z-index: 10;
+  text-shadow: 0 0 8px #0ff;
+  pointer-events: none;
+}
+
+#overlay {
+  position: fixed; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.9);
+  color: #fff; z-index: 20;
+  padding: 20px;
+}
+#overlay h1 { font-size: 26px; margin-bottom: 6px; color: #0ff; text-shadow: 0 0 20px #0ff; }
+#overlay .sub { font-size: 14px; color: rgba(255,255,255,0.5); margin-bottom: 20px; }
+
+/* 排行榜 */
+#leaderboard {
+  width: 280px; max-width: 90vw;
+  margin-bottom: 24px;
+}
+#leaderboard h3 {
+  font-size: 14px; color: rgba(0,255,255,0.7);
+  margin-bottom: 10px; text-align: center; letter-spacing: 2px;
+}
+#leaderboard .row {
+  display: flex; justify-content: space-between;
+  padding: 6px 12px; margin: 4px 0;
+  background: rgba(0,255,255,0.05);
+  border-radius: 4px;
+  font-size: 14px;
+}
+#leaderboard .row:nth-child(2) { color: #ff0; text-shadow: 0 0 6px #ff0; }
+#leaderboard .row:nth-child(3) { color: #fff; }
+#leaderboard .row:nth-child(4) { color: #0f0; }
+#leaderboard .row:nth-child(5) { color: #0ff; }
+#leaderboard .row:nth-child(6) { color: rgba(255,255,255,0.6); }
+#leaderboard .empty { color: rgba(255,255,255,0.3); text-align: center; font-size: 13px; padding: 12px; }
+
+#overlay .btn {
+  padding: 12px 32px; border: 1px solid #0ff; border-radius: 4px;
+  background: transparent; color: #0ff; font-size: 16px; cursor: pointer;
+  text-shadow: 0 0 8px #0ff; box-shadow: 0 0 12px rgba(0,255,255,0.3);
+}
+#overlay .btn:hover { background: rgba(0,255,255,0.15); }
+
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div id="ui" class="hidden">
+  <span id="score">0</span>
+  <span id="level">Lv.1</span>
+</div>
+
+<div id="overlay">
+  <h1>弹幕躲避 · HARD</h1>
+  <p class="sub">移动鼠标 / 手指控制蓝球 · 只有 1 条命</p>
+
+  <!-- 排行榜 -->
+  <div id="leaderboard">
+    <h3>— 本地排行 TOP 5 —</h3>
+    <div id="lb-list"></div>
+  </div>
+
+  <button class="btn" id="startBtn">开始</button>
+</div>
+
+<canvas id="c"></canvas>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H;
+function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
+resize();
+window.addEventListener('resize', resize);
+
+const overlay = document.getElementById('overlay');
+const startBtn = document.getElementById('startBtn');
+const ui = document.getElementById('ui');
+const scoreEl = document.getElementById('score');
+const levelEl = document.getElementById('level');
+const lbList = document.getElementById('lb-list');
+
+// ===== 排行榜 =====
+function getLeaderboard() {
+  try {
+    return JSON.parse(localStorage.getItem('dodge_lb') || '[]');
+  } catch { return []; }
+}
+function saveScore(score, level) {
+  const lb = getLeaderboard();
+  lb.push({ score, level, date: Date.now() });
+  lb.sort((a, b) => b.score - a.score);
+  lb.splice(5); // 只留前5
+  localStorage.setItem('dodge_lb', JSON.stringify(lb));
+}
+function renderLeaderboard() {
+  const lb = getLeaderboard();
+  if (lb.length === 0) {
+    lbList.innerHTML = '<div class="empty">暂无记录，快来创造第一个！</div>';
+    return;
+  }
+  const medals = ['🥇', '🥈', '🥉', '', ''];
+  lbList.innerHTML = lb.map((entry, i) => {
+    const date = new Date(entry.date);
+    const timeStr = `${date.getMonth()+1}/${date.getDate()} ${String(date.getHours()).padStart(2,'0')}:${String(date.getMinutes()).padStart(2,'0')}`;
+    return `<div class="row"><span>${medals[i]} ${entry.score} 分</span><span>Lv.${entry.level} · ${timeStr}</span></div>`;
+  }).join('');
+}
+
+// 初始渲染
+renderLeaderboard();
+
+// ===== 游戏状态 =====
+let running = false;
+let score = 0;
+let level = 1;
+let player, bullets = [], particles = [];
+let mouseX = 0, mouseY = 0;
+let time = 0;
+let spawnTimer = 0;
+let bossActive = false;
+let bossTimer = 0;
+
+// ===== 玩家 =====
+function initPlayer() {
+  player = {
+    x: W / 2, y: H * 0.85,
+    r: 8,
+    speed: 5.5,
+    trail: []
+  };
+}
+
+// ===== 弹幕生成器 =====
+function spawnBullet(type) {
+  const speed = 1.5 + level * 0.6;
+  const t = time * 0.02;
+
+  switch (type) {
+    case 'rain':
+      bullets.push({
+        x: rand(0, W), y: -10,
+        vx: rand(-0.3, 0.3), vy: speed * rand(0.8, 1.2),
+        r: rand(3, 5), color: `hsl(${rand(0,40)},100%,60%)`,
+        type: 'rain'
+      });
+      break;
+
+    case 'spiral':
+      const angle = t * 2 + rand(0, Math.PI * 2);
+      bullets.push({
+        x: W / 2, y: H / 2,
+        vx: Math.cos(angle) * speed * 1.3,
+        vy: Math.sin(angle) * speed * 1.3,
+        r: 4, color: `hsl(${200 + t * 50},100%,60%)`,
+        type: 'spiral'
+      });
+      break;
+
+    case 'sweep':
+      const dir = Math.sin(t * 0.5) > 0 ? 1 : -1;
+      bullets.push({
+        x: dir > 0 ? -10 : W + 10, y: rand(H * 0.1, H * 0.5),
+        vx: dir * speed * 1.5, vy: rand(-0.5, 0.5),
+        r: rand(3, 6), color: `hsl(${40 + rand(0,30)},100%,55%)`,
+        type: 'sweep'
+      });
+      break;
+
+    case 'aim':
+      const ax = rand(0, W), ay = -10;
+      const dx = player.x - ax, dy = player.y - ay;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      bullets.push({
+        x: ax, y: ay,
+        vx: (dx / dist) * speed * 0.9,
+        vy: (dy / dist) * speed * 0.9,
+        r: 5, color: `hsl(120,100%,55%)`,
+        type: 'aim'
+      });
+      break;
+
+    case 'ring':
+      const rings = 12 + level * 2;
+      for (let i = 0; i < rings; i++) {
+        const a = (Math.PI * 2 / rings) * i + t;
+        bullets.push({
+          x: W / 2, y: H / 2,
+          vx: Math.cos(a) * speed * 1.1,
+          vy: Math.sin(a) * speed * 1.1,
+          r: 4, color: `hsl(${280 + i * 10},100%,65%)`,
+          type: 'ring'
+        });
+      }
+      break;
+
+    case 'boss':
+      for (let i = 0; i < 5; i++) {
+        const a = (Math.PI * 2 / 5) * i + t * 3;
+        bullets.push({
+          x: W / 2, y: H * 0.3,
+          vx: Math.cos(a) * speed * 1.8,
+          vy: Math.sin(a) * speed * 1.8,
+          r: 6, color: `hsl(${rand(0,360)},100%,50%)`,
+          type: 'boss'
+        });
+      }
+      break;
+  }
+}
+
+// ===== 弹幕调度 =====
+function scheduleSpawns() {
+  const baseInterval = Math.max(3, 20 - level * 2);
+  spawnTimer++;
+  if (spawnTimer < baseInterval) return;
+  spawnTimer = 0;
+
+  const activeModes = ['rain'];
+  if (level >= 2) activeModes.push('spiral');
+  if (level >= 3) activeModes.push('sweep');
+  if (level >= 4) activeModes.push('aim');
+  if (level >= 5) activeModes.push('ring');
+
+  const count = Math.min(3, 1 + Math.floor(level / 2));
+  for (let i = 0; i < count; i++) {
+    const mode = activeModes[Math.floor(Math.random() * activeModes.length)];
+    const burstSize = level >= 5 ? 3 : 1;
+    for (let j = 0; j < burstSize; j++) {
+      spawnBullet(mode);
+    }
+  }
+
+  if (level % 5 === 0 && !bossActive) {
+    bossActive = true;
+    bossTimer = 60;
+  }
+  if (bossActive) {
+    bossTimer--;
+    spawnBullet('boss');
+    if (bossTimer <= 0) bossActive = false;
+  }
+}
+
+// ===== 碰撞 =====
+function checkHit() {
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    const dx = player.x - b.x, dy = player.y - b.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < player.r + b.r) {
+      for (let k = 0; k < 30; k++) {
+        particles.push({
+          x: player.x, y: player.y,
+          vx: rand(-4, 4), vy: rand(-4, 4),
+          life: 1, color: '#0ff'
+        });
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+// ===== 更新 =====
+function update() {
+  time++;
+
+  player.x += (mouseX - player.x) * 0.15;
+  player.y += (mouseY - player.y) * 0.15;
+  player.x = Math.max(player.r, Math.min(W - player.r, player.x));
+  player.y = Math.max(player.r, Math.min(H - player.r, player.y));
+
+  player.trail.push({ x: player.x, y: player.y });
+  if (player.trail.length > 12) player.trail.shift();
+
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.x += b.vx;
+    b.y += b.vy;
+    if (b.type === 'aim') {
+      const dx = player.x - b.x, dy = player.y - b.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      b.vx += (dx / dist) * 0.05;
+      b.vy += (dy / dist) * 0.05;
+    }
+    if (b.x < -50 || b.x > W + 50 || b.y < -50 || b.y > H + 50) {
+      bullets.splice(i, 1);
+    }
+  }
+
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy;
+    p.life -= 0.03;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  scheduleSpawns();
+
+  score += level;
+  scoreEl.textContent = score;
+
+  const newLevel = Math.floor(time / 300) + 1;
+  if (newLevel !== level) {
+    level = newLevel;
+    levelEl.textContent = `Lv.${level}`;
+  }
+
+  if (checkHit()) {
+    running = false;
+    saveScore(score, level); // 保存分数
+    renderLeaderboard(); // 刷新排行榜
+    overlay.classList.remove('hidden');
+    overlay.querySelector('h1').textContent = `死亡 · 得分 ${score}`;
+    overlay.querySelector('.sub').textContent = `你撑到了第 ${level} 关`;
+    startBtn.textContent = '再来一次';
+    ui.classList.add('hidden');
+  }
+}
+
+// ===== 绘制 =====
+function draw() {
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.fillRect(0, 0, W, H);
+
+  if (!running) return;
+
+  ctx.strokeStyle = 'rgba(0,255,255,0.03)';
+  ctx.lineWidth = 0.5;
+  const gridSize = 40;
+  for (let x = 0; x < W; x += gridSize) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+  }
+  for (let y = 0; y < H; y += gridSize) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+
+  for (let i = 0; i < player.trail.length; i++) {
+    const t = player.trail[i];
+    const alpha = i / player.trail.length * 0.4;
+    ctx.beginPath();
+    ctx.arc(t.x, t.y, player.r * 0.6, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(0,255,255,${alpha})`;
+    ctx.fill();
+  }
+
+  ctx.beginPath();
+  ctx.arc(player.x, player.y, player.r, 0, Math.PI * 2);
+  ctx.fillStyle = '#0ff';
+  ctx.shadowColor = '#0ff';
+  ctx.shadowBlur = 15;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  for (const b of bullets) {
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    ctx.fillStyle = b.color;
+    ctx.shadowColor = b.color;
+    ctx.shadowBlur = 8;
+    ctx.fill();
+  }
+  ctx.shadowBlur = 0;
+
+  for (const p of particles) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(0,255,255,${p.life})`;
+    ctx.fill();
+  }
+}
+
+// ===== 主循环 =====
+function loop() {
+  if (running) update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// ===== 输入 =====
+function updateMouse(e) {
+  mouseX = e.clientX || (e.touches && e.touches[0].clientX) || mouseX;
+  mouseY = e.clientY || (e.touches && e.touches[0].clientY) || mouseY;
+}
+window.addEventListener('mousemove', updateMouse);
+window.addEventListener('touchmove', e => { e.preventDefault(); updateMouse(e); }, { passive: false });
+
+// ===== 开始 =====
+startBtn.addEventListener('click', () => {
+  overlay.classList.add('hidden');
+  ui.classList.remove('hidden');
+  running = true;
+  score = 0;
+  level = 1;
+  time = 0;
+  bullets = [];
+  particles = [];
+  spawnTimer = 0;
+  bossActive = false;
+  initPlayer();
+  mouseX = W / 2;
+  mouseY = H * 0.85;
+  scoreEl.textContent = '0';
+  levelEl.textContent = 'Lv.1';
+});
+
+initPlayer();
+requestAnimationFrame(loop);
+
+function rand(min, max) { return Math.random() * (max - min) + min; }
+</script>
+</body>
+</html>
